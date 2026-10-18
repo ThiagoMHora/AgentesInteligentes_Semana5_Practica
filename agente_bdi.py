@@ -10,7 +10,7 @@ Implementa el intérprete BDI de Wooldridge:
     π := plan(B, I, Π)   # con Fallback Plans
     execute(π)
 
-
+Decisiones de diseño:
   1. La creencia 'anomalia_fuga_memoria' es MONÓTONA: una vez inferida,
      no se resetea (una fuga de memoria no se auto-cura).
   2. El deseo RESTAURAR_SERVICIO_CACHE se condiciona a una creencia
@@ -20,6 +20,12 @@ Implementa el intérprete BDI de Wooldridge:
   4. Se encapsula el ciclo BDI completo en 'ejecutar_ciclo'.
   5. Se guarda self.plan_activo y self.cola_acciones para dar continuidad
      entre ciclos.
+  6. Los planes fallidos se guardan en una LISTA ('planes_fallidos'), no en
+     un solo nombre, y se limpian cuando la cuota cloud se restablece.
+  7. Solo se marcan como fallidos los planes que dependen de la cuota cloud
+     (PlanBDI.requiere_cuota); un plan que no la usa no se descarta.
+  8. Un deseo que lleva ciclos activo sin ser intención gana prioridad
+     (envejecimiento), sin superar nunca a la seguridad (100).
 """
 
 from dataclasses import dataclass
@@ -42,6 +48,17 @@ class TelemetriaCluster:
 class Deseo:
     nombre: str
     prioridad: int
+    postergado: int = 0       # ciclos seguidos activo sin ser intención
+    envejece: bool = True     # el deseo de fondo no envejece
+    incremento: int = 5       # puntos que gana por ciclo postergado
+    tope: int = 99            # nunca supera a la seguridad (100)
+
+    @property
+    def prioridad_efectiva(self) -> int:
+        if not self.envejece or self.postergado == 0:
+            return self.prioridad
+        return max(self.prioridad,
+                   min(self.tope, self.prioridad + self.incremento * self.postergado))
 
 
 @dataclass
@@ -50,6 +67,7 @@ class PlanBDI:
     intencion_meta: str
     precondicion: Callable[[Dict[str, Any]], bool]
     cuerpo_acciones: List[str]
+    requiere_cuota: bool = False   # True si el plan consume cuota cloud
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +87,15 @@ class AgenteBDI_Estudiante:
             "bajo_ataque": False,
             "cuota_cloud_agotada": False,
             "latencia_alta": False,
-            "plan_fallido": None,
+            "planes_fallidos": [],
         }
         self.intencion_actual: Optional[Deseo] = None
         self.plan_activo: Optional[PlanBDI] = None
         self.cola_acciones: List[str] = []
+        self.postergaciones: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
-    # TAREA 1 — brf: Revisión de creencias con inferencia deductiva
+    # brf: Revisión de creencias con inferencia deductiva
     # ------------------------------------------------------------------
     def brf(self, p: TelemetriaCluster) -> None:
         """
@@ -84,11 +103,11 @@ class AgenteBDI_Estudiante:
 
         Regla deductiva: si las últimas 3 lecturas de CPU son
         estrictamente crecientes y (p3 - p1) >= 15.0, se deriva
-        proactivamente 'anomalia_fuga_memoria = True'.
+        proactivamente 'anomalia_fuga_memoria = True' (monótona).
 
-        Decisión de diseño: la creencia derivada es MONÓTONA (no se
-        resetea). Una fuga de memoria solo se repara con una acción
-        (reinicio del pod), no por una bajada puntual de la CPU.
+        Reconsideración dinámica: si la cuota cloud se agotó y el plan
+        activo depende de ella, se agrega a 'planes_fallidos' para forzar
+        el fallback. Cuando la cuota se restablece, la lista se limpia.
         """
         # 1) Ventana deslizante de tamaño 3
         self.creencias["historial_cpu"].append(p.cpu_pct)
@@ -107,84 +126,92 @@ class AgenteBDI_Estudiante:
             if p1 < p2 < p3 and (p3 - p1) >= self.UMBRAL_INCREMENTO_FUGA:
                 self.creencias["anomalia_fuga_memoria"] = True
 
-        # 4) Reconsideración dinámica: si la cuota cloud se agotó y hay
-        #    un plan activo, marcarlo como fallido para forzar el fallback
-        #    en la selección de plan del ciclo actual.
-        if self.creencias["cuota_cloud_agotada"] and self.plan_activo is not None:
-            self.creencias["plan_fallido"] = self.plan_activo.nombre
+        # 4) Reconsideración dinámica de planes
+        fallidos: List[str] = self.creencias["planes_fallidos"]
+        if self.creencias["cuota_cloud_agotada"]:
+            plan = self.plan_activo
+            if plan is not None and plan.requiere_cuota and plan.nombre not in fallidos:
+                fallidos.append(plan.nombre)
+        else:
+            fallidos.clear()   # la cuota se restableció: los planes vuelven a ser viables
 
     # ------------------------------------------------------------------
-    # TAREA 2 — options: Generación de deseos según creencias
+    # options: Generación de deseos según creencias
     # ------------------------------------------------------------------
     def options(self) -> Dict[str, Deseo]:
         """
         Genera el conjunto de deseos D a partir de las creencias.
-        Jerarquía exigida:
+        Jerarquía base:
             MITIGAR_INTRUSION_SEGURIDAD  -> 100
             RESTAURAR_SERVICIO_CACHE     ->  80
             PREVENIR_CAIDA_OOM           ->  75
             ESTABILIZAR_RENDIMIENTO_SLA  ->  60
         """
+        post = self.postergaciones
         opciones: Dict[str, Deseo] = {}
 
-        # Seguridad: solo si hay alerta SIEM activa.
         if self.creencias.get("bajo_ataque", False):
             opciones["MITIGAR_INTRUSION_SEGURIDAD"] = Deseo(
-                "MITIGAR_INTRUSION_SEGURIDAD", 100
-            )
+                "MITIGAR_INTRUSION_SEGURIDAD", 100,
+                post.get("MITIGAR_INTRUSION_SEGURIDAD", 0))
 
-        # Caché: solo si la latencia es alta (creencia derivada en brf).
         if self.creencias.get("latencia_alta", False):
             opciones["RESTAURAR_SERVICIO_CACHE"] = Deseo(
-                "RESTAURAR_SERVICIO_CACHE", 80
-            )
+                "RESTAURAR_SERVICIO_CACHE", 80,
+                post.get("RESTAURAR_SERVICIO_CACHE", 0))
 
-        # Prevención OOM: solo si se infirió fuga de memoria.
         if self.creencias.get("anomalia_fuga_memoria", False):
             opciones["PREVENIR_CAIDA_OOM"] = Deseo(
-                "PREVENIR_CAIDA_OOM", 75
-            )
+                "PREVENIR_CAIDA_OOM", 75,
+                post.get("PREVENIR_CAIDA_OOM", 0))
 
-        # Homeostasis: deseo de fondo siempre presente.
+        # Homeostasis: deseo de fondo siempre presente (no envejece).
         opciones["ESTABILIZAR_RENDIMIENTO_SLA"] = Deseo(
-            "ESTABILIZAR_RENDIMIENTO_SLA", 60
-        )
+            "ESTABILIZAR_RENDIMIENTO_SLA", 60, envejece=False)
 
         return opciones
 
     # ------------------------------------------------------------------
-    # TAREA 3 — filter: Selección de intención (mente abierta)
+    # filter: Selección de intención (mente abierta)
     # ------------------------------------------------------------------
     def filter(self, opciones: Dict[str, Deseo]) -> Optional[Deseo]:
         """
-        Selecciona la intención de mayor prioridad. Al recalcularse en
-        cada ciclo, el compromiso es 'de mente abierta': el agente puede
-        cambiar de foco si aparece un deseo más prioritario.
+        Selecciona la intención de mayor prioridad efectiva. Al recalcularse
+        en cada ciclo, el compromiso es 'de mente abierta'.
         """
         if not opciones:
             return None
-        return max(opciones.values(), key=lambda d: d.prioridad)
+        return max(opciones.values(), key=lambda d: d.prioridad_efectiva)
+
+    def _actualizar_postergaciones(self, opciones: Dict[str, Deseo],
+                                   intencion: Optional[Deseo]) -> None:
+        """Cuenta los ciclos que cada deseo lleva activo sin ser intención."""
+        nuevas: Dict[str, int] = {}
+        for nombre, deseo in opciones.items():
+            if not deseo.envejece:
+                continue
+            if intencion is not None and nombre == intencion.nombre:
+                nuevas[nombre] = 0
+            else:
+                nuevas[nombre] = self.postergaciones.get(nombre, 0) + 1
+        self.postergaciones = nuevas
 
     # ------------------------------------------------------------------
-    # TAREA 4 — Selección de plan con Fallback Plans
+    # Selección de plan con Fallback Plans
     # ------------------------------------------------------------------
     def seleccionar_plan_fallback(
         self, intencion: Deseo, biblioteca: List[PlanBDI]
     ) -> Optional[PlanBDI]:
         """
         Retorna el primer plan aplicable para la intención dada cuya
-        precondición se cumpla y que NO esté marcado como fallido.
-
-        Esto implementa el Fallback Plan: si el plan principal falla
-        (p. ej. cuota_cloud_agotada), se conmuta al alternativo sin
-        abandonar la Intención.
+        precondición se cumpla y que NO esté en 'planes_fallidos'.
         """
-        plan_fallido = self.creencias.get("plan_fallido")
+        fallidos = self.creencias.get("planes_fallidos", [])
 
         for plan in biblioteca:
             if plan.intencion_meta != intencion.nombre:
                 continue
-            if plan_fallido is not None and plan.nombre == plan_fallido:
+            if plan.nombre in fallidos:
                 continue
             try:
                 if plan.precondicion(self.creencias):
@@ -203,27 +230,20 @@ class AgenteBDI_Estudiante:
         biblioteca: List[PlanBDI],
     ) -> List[str]:
         """
-        Ejecuta un ciclo BDI completo:
-            brf -> options -> filter -> plan (con fallback) -> execute
+        brf -> options -> filter -> plan (con fallback) -> execute
         Devuelve la cola de acciones del plan activo.
         """
-        # 1) Revisión de creencias
         self.brf(telemetria)
-
-        # 2) Generación de opciones
         opciones = self.options()
-
-        # 3) Filtrado de intenciones
         self.intencion_actual = self.filter(opciones)
+        self._actualizar_postergaciones(opciones, self.intencion_actual)
 
-        # 4) Selección de plan con fallback
         self.plan_activo = None
         if self.intencion_actual is not None:
             self.plan_activo = self.seleccionar_plan_fallback(
                 self.intencion_actual, biblioteca
             )
 
-        # 5) Ejecución (encolar acciones)
         self.cola_acciones = (
             list(self.plan_activo.cuerpo_acciones) if self.plan_activo else []
         )
@@ -239,13 +259,11 @@ def construir_biblioteca_planes() -> List[PlanBDI]:
 
     Para ESTABILIZAR_RENDIMIENTO_SLA se registran DOS planes:
       - Principal: Runbook_Autoescalado_Horizontal
-                   (precondición: hay cuota cloud)
+                   (precondición: hay cuota cloud; requiere_cuota=True)
       - Fallback:  Runbook_Degradacion_Elegante_CircuitBreaker
                    (precondición: cuota cloud agotada)
-    Así, cuando 'cuota_cloud_agotada == True', el agente conmuta solo.
     """
     return [
-        # --- Plan principal: Autoescalado horizontal ---
         PlanBDI(
             nombre="Runbook_Autoescalado_Horizontal",
             intencion_meta="ESTABILIZAR_RENDIMIENTO_SLA",
@@ -254,8 +272,8 @@ def construir_biblioteca_planes() -> List[PlanBDI]:
                 "APROVISIONAR_NODO_REPLICA_K8S",
                 "REBALANCEAR_TRAFICO_INGRESS",
             ],
+            requiere_cuota=True,
         ),
-        # --- Plan fallback: Degradación elegante con Circuit Breaker ---
         PlanBDI(
             nombre="Runbook_Degradacion_Elegante_CircuitBreaker",
             intencion_meta="ESTABILIZAR_RENDIMIENTO_SLA",
@@ -265,7 +283,6 @@ def construir_biblioteca_planes() -> List[PlanBDI]:
                 "HABILITAR_RESPUESTA_ESTATICA_CDN",
             ],
         ),
-        # --- Planes auxiliares coherentes con el resto de deseos ---
         PlanBDI(
             nombre="Runbook_Aislar_Nodo_Comprometido",
             intencion_meta="MITIGAR_INTRUSION_SEGURIDAD",
@@ -299,40 +316,44 @@ def construir_biblioteca_planes() -> List[PlanBDI]:
 # ---------------------------------------------------------------------------
 # Simulación principal
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("=== EVALUACIÓN EJERCICIO 1: AGENTE BDI ===")
-
+def _correr(titulo, lecturas, biblioteca):
+    print(f"\n=== {titulo} ===")
     agente = AgenteBDI_Estudiante()
-    biblioteca_planes = construir_biblioteca_planes()
-
-    # Escenario 1: CPU [40, 58, 75] -> debe inferirse fuga de memoria.
-    # Escenario 2: cuota agotada -> debe conmutar al plan fallback.
-    # Escenario 3: alerta SIEM -> debe priorizar seguridad (100).
-    lecturas = [
-        TelemetriaCluster(ciclo=1, cpu_pct=40.0, latencia_ms=120.0,
-                          alerta_siem=False, cuota_agotada=False),
-        TelemetriaCluster(ciclo=2, cpu_pct=58.0, latencia_ms=150.0,
-                          alerta_siem=False, cuota_agotada=False),
-        TelemetriaCluster(ciclo=3, cpu_pct=75.0, latencia_ms=180.0,
-                          alerta_siem=False, cuota_agotada=False),
-        TelemetriaCluster(ciclo=4, cpu_pct=82.0, latencia_ms=210.0,
-                          alerta_siem=False, cuota_agotada=True),
-        TelemetriaCluster(ciclo=5, cpu_pct=85.0, latencia_ms=230.0,
-                          alerta_siem=True,  cuota_agotada=True),
-    ]
-
     for tel in lecturas:
         print(f"\n--- Ciclo {tel.ciclo} "
               f"(CPU: {tel.cpu_pct}%, Latencia: {tel.latencia_ms}ms, "
               f"SIEM: {tel.alerta_siem}, Cuota agotada: {tel.cuota_agotada}) ---")
-
-        acciones = agente.ejecutar_ciclo(tel, biblioteca_planes)
-
-        print(f"  Creencias: fuga_memoria={agente.creencias['anomalia_fuga_memoria']}, "
-              f"latencia_alta={agente.creencias['latencia_alta']}, "
-              f"bajo_ataque={agente.creencias['bajo_ataque']}, "
-              f"cuota_agotada={agente.creencias['cuota_cloud_agotada']}, "
-              f"plan_fallido={agente.creencias['plan_fallido']}")
-        print(f"  Intención : {agente.intencion_actual.nombre if agente.intencion_actual else None}")
+        acciones = agente.ejecutar_ciclo(tel, biblioteca)
+        c = agente.creencias
+        print(f"  Creencias: fuga_memoria={c['anomalia_fuga_memoria']}, "
+              f"latencia_alta={c['latencia_alta']}, "
+              f"bajo_ataque={c['bajo_ataque']}, "
+              f"cuota_agotada={c['cuota_cloud_agotada']}, "
+              f"planes_fallidos={c['planes_fallidos']}")
+        i = agente.intencion_actual
+        print(f"  Intención : {i.nombre if i else None}"
+              f" (prioridad efectiva {i.prioridad_efectiva if i else '-'})")
         print(f"  Plan      : {agente.plan_activo.nombre if agente.plan_activo else None}")
         print(f"  Acciones  : {acciones}")
+
+
+if __name__ == "__main__":
+    biblioteca_planes = construir_biblioteca_planes()
+
+    # Escenario 1: CPU [40, 58, 75] -> fuga; cuota agotada; alerta SIEM.
+    _correr("EVALUACIÓN EJERCICIO 1: AGENTE BDI", [
+        TelemetriaCluster(1, 40.0, 120.0, False, False),
+        TelemetriaCluster(2, 58.0, 150.0, False, False),
+        TelemetriaCluster(3, 75.0, 180.0, False, False),
+        TelemetriaCluster(4, 82.0, 210.0, False, True),
+        TelemetriaCluster(5, 85.0, 230.0, True, True),
+    ], biblioteca_planes)
+
+    # Escenario 2: cuota agotada sostenida con el SLA como intención:
+    # debe conmutar al plan fallback y volver al principal al restablecerse.
+    _correr("ESCENARIO 2: CUOTA AGOTADA SOSTENIDA", [
+        TelemetriaCluster(1, 35.0, 120.0, False, False),
+        TelemetriaCluster(2, 36.0, 130.0, False, True),
+        TelemetriaCluster(3, 34.0, 125.0, False, True),
+        TelemetriaCluster(4, 33.0, 120.0, False, False),
+    ], biblioteca_planes)

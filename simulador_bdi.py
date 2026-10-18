@@ -1,11 +1,10 @@
-
 import copy
 import importlib
 from math import ceil
 import tkinter as tk
 from tkinter import ttk
 
-MODULO_AGENTE = "agente_bdi" 
+MODULO_AGENTE = "agente_bdi"
 
 _m = importlib.import_module(MODULO_AGENTE)
 AgenteBDI_Estudiante = _m.AgenteBDI_Estudiante
@@ -26,7 +25,7 @@ OK = ("#176148", "#D5F1E4"); WARN = ("#854A07", "#FFE9C9"); BAD = ("#9C3248", "#
 F = "Segoe UI"; FM = "Consolas"
 
 
-DESEOS = [  # nombre, prioridad, tono, etiqueta corta, creencia que lo activa
+DESEOS = [  # nombre, prioridad base, tono, etiqueta corta, creencia que lo activa
     ("MITIGAR_INTRUSION_SEGURIDAD", 100, "sec", "Seguridad", "bajo_ataque"),
     ("RESTAURAR_SERVICIO_CACHE", 80, "cache", "Caché", "latencia_alta"),
     ("PREVENIR_CAIDA_OOM", 75, "oom", "OOM", "anomalia_fuga_memoria"),
@@ -42,7 +41,7 @@ PRECOND = {
     "Runbook_Mitigar_Fuga_Memoria": ("anomalia_fuga_memoria", True),
 }
 CREENCIAS = ["anomalia_fuga_memoria", "bajo_ataque", "cuota_cloud_agotada",
-             "latencia_alta", "plan_fallido"]
+             "latencia_alta", "planes_fallidos"]
 ETAPAS = [
     ("Percibir", "B — Creencias · lo que el agente sabe", "brf(B, telemetría)", "Percibiendo la telemetría…"),
     ("Deliberar", "D — Deseos · lo que podría querer", "options(B) → D", "Generando deseos…"),
@@ -53,11 +52,13 @@ ESCENARIOS = [
     ("codigo", "Tu simulación (5 ciclos)"),
     ("cuota", "Cuota agotada sostenida"),
     ("siem", "Alerta de seguridad que pasa"),
+    ("espera", "Deseo postergado que envejece"),
 ]
 PRESETS = {  # cpu, latencia, alerta SIEM, cuota agotada
     "codigo": [(40, 120, 0, 0), (58, 150, 0, 0), (75, 180, 0, 0), (82, 210, 0, 1), (85, 230, 1, 1)],
     "cuota": [(35, 120, 0, 0), (36, 130, 0, 1), (34, 125, 0, 1), (33, 120, 0, 0)],
     "siem": [(30, 100, 0, 0), (31, 110, 1, 0), (32, 250, 0, 0), (30, 120, 0, 0)],
+    "espera": [(40, 250, 0, 0), (58, 250, 0, 0), (75, 250, 0, 0), (76, 250, 0, 0), (77, 250, 0, 0), (78, 250, 0, 0)],
 }
 GLOSARIO = [
     ("Creencias (B)", "Lo que el agente sabe del mundo: CPU, latencia, alertas y cuota."),
@@ -65,14 +66,14 @@ GLOSARIO = [
     ("Intención (I)", "El deseo que el agente decide perseguir ahora."),
     ("Plan (π)", "La lista de acciones con la que intenta lograr la intención."),
     ("Plan alternativo (fallback)", "El que se usa cuando el principal no es viable, sin abandonar la intención."),
-    ("Plan fallido", "Un plan que el agente marcó como inviable y descarta al elegir."),
+    ("Plan fallido", "Un plan que depende de la cuota cloud y que el agente descarta mientras la cuota siga agotada."),
+    ("Prioridad efectiva", "La prioridad base más 5 puntos por cada ciclo que el deseo lleva activo sin ser intención (máximo 99)."),
     ("Fuga de memoria", "Se deduce cuando la CPU sube sin pausa y suma al menos 15 puntos en tres lecturas."),
 ]
 
 
 def crear(clave):
     return [{"cpu": c, "lat": l, "siem": bool(s), "cuota": bool(q)} for c, l, s, q in PRESETS[clave]]
-
 
 
 def simular(lista):
@@ -82,7 +83,6 @@ def simular(lista):
     int_prev = None
     for i, t in enumerate(lista):
         antes = copy.deepcopy(agente.creencias)
-        plan_prev = agente.plan_activo
 
         # Se "espía" options() solo para guardar el conjunto de deseos generado.
         capturado = {}
@@ -96,7 +96,7 @@ def simular(lista):
         agente.options = espiar
         tel = TelemetriaCluster(ciclo=i + 1, cpu_pct=float(t["cpu"]), latencia_ms=float(t["lat"]),
                                 alerta_siem=bool(t["siem"]), cuota_agotada=bool(t["cuota"]))
-        acciones = agente.ejecutar_ciclo(tel, biblioteca)     
+        acciones = agente.ejecutar_ciclo(tel, biblioteca)
         del agente.options
 
         despues = copy.deepcopy(agente.creencias)
@@ -108,7 +108,8 @@ def simular(lista):
             mono = p1 < p2 < p3
             delta = p3 - p1
             cumple = mono and delta >= agente.UMBRAL_INCREMENTO_FUGA
-        marcado = plan_prev.nombre if (despues["cuota_cloud_agotada"] and plan_prev is not None) else None
+        nuevos = [n for n in despues["planes_fallidos"] if n not in antes["planes_fallidos"]]
+        marcado = nuevos[0] if nuevos else None
 
         intencion = agente.intencion_actual
         plan = agente.plan_activo
@@ -121,7 +122,7 @@ def simular(lista):
                 visto = True
             elif visto:
                 v = "skip"
-            elif despues["plan_fallido"] is not None and p.nombre == despues["plan_fallido"]:
+            elif p.nombre in despues["planes_fallidos"]:
                 v = "failed"
             else:
                 v = "pre"
@@ -141,14 +142,21 @@ def si_no(v):
     return "True" if v else "False"
 
 
+def envejecido(r):
+    """True si la intención ganó gracias a ciclos de espera."""
+    return r["intencion"].prioridad_efectiva > r["intencion"].prioridad
+
+
 def narrar(r):
     c = r["despues"]
     if c["bajo_ataque"]:
         return "Alerta SIEM. La seguridad tiene prioridad 100 y desplaza todo lo demás."
     if r["plan"] is None:
         return "Ningún plan aplicable. El agente queda a la espera."
+    if envejecido(r):
+        return "Un deseo que llevaba ciclos esperando subió de prioridad y por fin se atiende."
     if r["marcado"]:
-        return "La cuota cloud se agotó con un plan en marcha: el agente lo marca como fallido y sigue con lo más urgente."
+        return "La cuota cloud se agotó con un plan en marcha que depende de ella: el agente lo marca como fallido y conmuta al alternativo."
     if r["cumple"] and not r["antes"]["anomalia_fuga_memoria"]:
         return "Fuga inferida. El agente actúa antes de que la CPU llegue al límite."
     if c["anomalia_fuga_memoria"]:
@@ -164,6 +172,8 @@ def resumen(r):
         return "alerta SIEM, prioridad 100"
     if r["plan"] is None:
         return "sin plan aplicable"
+    if envejecido(r):
+        return "deseo postergado atendido"
     if r["cumple"] and not r["antes"]["anomalia_fuga_memoria"]:
         return "fuga inferida"
     if r["marcado"]:
@@ -192,18 +202,24 @@ def razonamiento(r):
     L.append(("PERCIBIR", p, False))
 
     activos = [d for d in DESEOS if d[0] in r["deseos"]]
-    txt = "Deseos activos: " + ", ".join(f"{d[3]} ({d[1]})" for d in activos) + "."
+    txt = "Deseos activos: " + ", ".join(
+        f"{d[3]} ({r['deseos'][d[0]].prioridad_efectiva})" for d in activos) + "."
     if len(activos) < 4:
         txt += " Los demás no se generan porque su creencia es False."
     L.append(("DELIBERAR", txt, False))
 
     nombre = r["intencion"].nombre
+    ef = r["intencion"].prioridad_efectiva
     otros = [d for d in activos if d[0] != nombre]
     if otros:
-        s = (f"Gana {CORTO[nombre]} porque su prioridad ({r['intencion'].prioridad}) es la más alta "
-             f"entre los activos; la siguiente es {otros[0][1]}.")
+        sig = max(r["deseos"][d[0]].prioridad_efectiva for d in otros)
+        s = (f"Gana {CORTO[nombre]} porque su prioridad efectiva ({ef}) es la más alta "
+             f"entre los activos; la siguiente es {sig}.")
     else:
         s = f"{CORTO[nombre]} es el único deseo activo, así que es la intención."
+    if envejecido(r):
+        s += (f" Su prioridad base es {r['intencion'].prioridad}, pero lleva {r['intencion'].postergado} "
+              f"ciclo(s) esperando y ganó {ef - r['intencion'].prioridad} puntos.")
     if r["int_prev"] is not None and r["int_prev"].nombre != nombre:
         s += f" El agente cambia de foco: antes perseguía {CORTO[r['int_prev'].nombre]}."
     L.append(("DECIDIR", s, False))
@@ -226,16 +242,13 @@ def razonamiento(r):
     L.append(("ACTUAR", a, False))
 
     if r["marcado"]:
-        txt = (f"La cuota está agotada y el plan activo del ciclo anterior era {r['marcado']}, "
-               f"así que brf lo marcó como fallido.")
-        # ¿pertenece a otra meta distinta de la intención actual?
-        pert = next((d for d in _m.construir_biblioteca_planes() if d.nombre == r["marcado"]), None)
-        if pert is not None and pert.intencion_meta != nombre:
-            txt += " Ese plan pertenece a otra meta, y seguirá descartado mientras plan_fallido no cambie."
-        L.append(("ATENCIÓN", txt, True))
-    elif c["plan_fallido"]:
-        L.append(("ATENCIÓN", f"{c['plan_fallido']} sigue marcado como fallido de un ciclo anterior. "
-                              f"El código nunca limpia plan_fallido.", True))
+        L.append(("ATENCIÓN",
+                  f"La cuota está agotada y el plan activo del ciclo anterior, {r['marcado']}, depende de ella, "
+                  f"así que brf lo marcó como fallido y el agente conmuta al plan alternativo.", True))
+    elif c["planes_fallidos"]:
+        L.append(("ATENCIÓN",
+                  f"{', '.join(c['planes_fallidos'])} sigue marcado como fallido mientras la cuota siga agotada; "
+                  f"se limpia cuando la cuota se restablezca.", True))
     return L
 
 
@@ -764,8 +777,11 @@ class App(tk.Tk):
             fila.pack(fill="x", pady=2)
             tk.Label(fila, text=clave, bg=bg, fg=MUTED, font=(FM, 8)).pack(anchor="w", padx=6, pady=(3, 0))
             v = c[clave]
-            if clave == "plan_fallido":
-                sm = semaforo(fila, "ok", "●", "None") if v is None else semaforo(fila, "bad", "■", v, wrap=self.wc - 30)
+            if clave == "planes_fallidos":
+                if not v:
+                    sm = semaforo(fila, "ok", "●", "[]")
+                else:
+                    sm = semaforo(fila, "bad", "■", ", ".join(v), wrap=self.wc - 30)
             elif not v:
                 sm = semaforo(fila, "ok", "●", "False")
             else:
@@ -809,7 +825,13 @@ class App(tk.Tk):
             fila = tk.Frame(f, bg=bg, highlightthickness=1, highlightbackground=pastel if activo else LINE)
             fila.pack(fill="x", pady=2)
             self.t(fila, nombre, fg=fuerte if activo else MUTED, bg=bg, font=(FM, 8, "bold")).pack(anchor="w", padx=6, pady=(4, 0))
-            self.t(fila, f"{'● Activo' if activo else '○ No generado'} · prioridad {prio}", fg=fuerte if activo else MUTED,
+            if activo:
+                ef = r["deseos"][nombre].prioridad_efectiva
+                pr = f"prioridad {prio}" if ef == prio else f"prioridad {prio} → efectiva {ef}"
+                estado = f"● Activo · {pr}"
+            else:
+                estado = f"○ No generado · prioridad {prio}"
+            self.t(fila, estado, fg=fuerte if activo else MUTED,
                    bg=bg, font=(F, 9, "bold")).pack(anchor="w", padx=6)
             cond = "Deseo de fondo, siempre presente." if clave is None else \
                 f"Se genera si {clave} es True; ahora es {si_no(c[clave])}."
@@ -821,9 +843,11 @@ class App(tk.Tk):
         caja = tk.Frame(f, bg=pastel, highlightthickness=2, highlightbackground=fuerte)
         caja.pack(fill="x")
         self.t(caja, nombre, fg=fuerte, bg=pastel, font=(FM, 9, "bold")).pack(anchor="w", padx=8, pady=(8, 0))
-        self.t(caja, f"prioridad {r['intencion'].prioridad}", fg=MUTED, bg=pastel, font=(FM, 9)).pack(anchor="w", padx=8, pady=(0, 8))
+        self.t(caja, f"prioridad efectiva {r['intencion'].prioridad_efectiva}", fg=MUTED, bg=pastel, font=(FM, 9)).pack(anchor="w", padx=8, pady=(0, 8))
         otros = [d for d in DESEOS if d[0] in r["deseos"] and d[0] != nombre]
         txt = "Gana por tener la mayor prioridad entre los activos." if otros else "Es el único deseo activo."
+        if envejecido(r):
+            txt += f" Su prioridad base es {r['intencion'].prioridad}: subió por esperar {r['intencion'].postergado} ciclo(s)."
         if r["int_prev"] is not None and r["int_prev"].nombre != nombre:
             txt += f" El agente cambió de foco: antes perseguía {CORTO[r['int_prev'].nombre]}."
         elif r["int_prev"] is not None:
